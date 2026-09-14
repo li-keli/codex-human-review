@@ -1,6 +1,6 @@
 # Codex 富文本人工复核
 
-0.5.2：使用 Codex 内置浏览器面板展示独立富文本审核页，替代原生 Question。Python 标准库服务负责题目、提交和状态保存，skill 负责查证、分支与队列。
+0.5.3：使用 Codex 内置浏览器面板展示独立富文本审核页，替代原生 Question。Python 标准库服务负责题目、提交和状态保存，skill 负责查证、分支与队列。
 
 灵感来自 **pi-interview**。本插件将逐项人工决策的交互方式应用于 Codex 内置浏览器审核流程。
 
@@ -37,7 +37,7 @@
 3. 用内置浏览器打开输出的完整 URL。
 4. `python3 scripts/review.py publish --session <目录> --file <题目JSON>` 发布单题。
 5. 保持当前 Codex 任务运行，用户可在选项中 Ask 继续追问；`python3 scripts/review.py wait --session <目录> --seconds 45` 读取 Ask 或最终答案。Ask 由当前模型回答后以 `respond --file <回答JSON>` 写回；最终提交后由任务关闭对应标签页。
-6. Codex 调整队列，发布下一题，或使用 `finish --summary '<结论>'` 完成。
+6. 关闭标签后执行 `python3 scripts/review.py stop --session <目录> --revision <当前版本>` 并确认进程退出。下一题同目录重启服务后再发布。Codex 调整队列，发布下一题，或在清理前使用 `finish --summary '<结论>'` 完成。
 
 以上相对脚本路径以插件根目录为基准。题目格式见 `skills/human-review/references/question-schema.md`。
 
@@ -77,3 +77,9 @@ Markdown 仅支持段落、换行、标题、列表、粗体和代码；没有�
 HTTP 服务最多处理 16 个并发连接，连接读写超时 5 秒；网络回包不持有状态锁。现有服务需停止后用原会话目录重启才会加载新代码，新 URL 替代旧 URL。
 
 回归验证：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`；`node --test tests/frontend.test.cjs`。
+
+## 0.5.3 服务回收
+
+参照 Pi 的结束回调清理机制，关闭本题标签后立即调用 `stop`，停止监听并退出服务；结果保留在会话目录。下一题按需同目录重启，使用新的连接 URL。`stop` 需要控制令牌与当前 revision，拒绝停止待答题或过期版本。
+
+若助手中断未执行清理，服务在题目已提交、暂缓、超时或完成后约 60 秒自动回收。此兜底只停止服务，不负责关闭 Codex 标签。保持原有 10 分钟无操作规则，Ask 期间不回收服务。

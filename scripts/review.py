@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, parse_qs
 
 ROOT = Path(__file__).resolve().parents[1]
+TERMINAL = frozenset(('answered', 'paused', 'timed_out', 'completed'))
 
 
 def notify_macos(question, thread_id=None):
@@ -117,6 +118,7 @@ class Review:
         self.path = directory / 'state.json'
         self.activity_path = directory / 'activity.json'
         self.notifying = set()
+        self.stopping = False
         self.lock = threading.Condition()
         self.now = now
         self.idle_seconds = idle_seconds
@@ -135,8 +137,8 @@ class Review:
 
     def expire(self):
         with self.lock:
-            d = copy.deepcopy(self.data)
-            if d['status'] == 'pending' and self.now() >= d['deadline']:
+            if self.data['status'] == 'pending' and self.now() >= self.data['deadline']:
+                d = copy.deepcopy(self.data)
                 d.update(status='timed_out', timeout_reason='长时间无操作，尚未抉择，等待用户处理。')
                 for ask in d['asks']:
                     if ask['status'] == 'pending':
@@ -147,6 +149,15 @@ class Review:
                 self.lock.notify_all()
                 return True
             return False
+
+    def prepare_stop(self, revision):
+        with self.lock:
+            self.expire()
+            if self.data['status'] not in TERMINAL or revision != self.data['revision']:
+                raise ValueError('仅能停止指定版本的已结束题目，待答时不能停止')
+            self.stopping = True
+            self.lock.notify_all()
+            return {'stopping': True, 'revision': revision, 'status': self.data['status']}
 
     def has_event(self):
         return self.data['status'] != 'pending' or any(a['status'] == 'pending' for a in self.data['asks'])
@@ -165,6 +176,8 @@ class Review:
 
     def notify(self):
         with self.lock:
+            if self.stopping:
+                raise ValueError('服务正在停止，请启动新服务')
             self.expire()
             d = self.data
             revision = d['revision']
@@ -193,6 +206,8 @@ class Review:
         if action == 'notify':
             return self.notify()
         with self.lock:
+            if self.stopping:
+                raise ValueError('服务正在停止，请启动新服务')
             self.expire()
             if action == 'activity':
                 if self.data['status'] != 'pending' or body.get('revision') != self.data['revision']:
@@ -320,7 +335,7 @@ def serve(args):
 
         def do_POST(self):
             action = self.path.removeprefix('/api/')
-            if self.path not in ('/api/publish', '/api/answer', '/api/finish', '/api/wait', '/api/ask', '/api/respond', '/api/activity', '/api/notify'):
+            if self.path not in ('/api/publish', '/api/answer', '/api/finish', '/api/wait', '/api/ask', '/api/respond', '/api/activity', '/api/notify', '/api/stop'):
                 return self.reply(404, {'error': '接口不存在'})
             if not self.authorized(control=action not in ('answer', 'ask', 'activity')):
                 return self.reply(401, {'error': '无访问权限'})
@@ -331,6 +346,13 @@ def serve(args):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ValueError('请求必须为对象')
+                if action == 'stop':
+                    result = state.prepare_stop(body.get('revision'))
+                    try:
+                        self.reply(200, result)
+                    finally:
+                        threading.Thread(target=server.shutdown, daemon=True).start()
+                    return
                 if action == 'wait':
                     seconds = max(0, min(float(body.get('seconds', 45)), 50))
                     with state.lock:
@@ -352,9 +374,27 @@ def serve(args):
     stop_watch = threading.Event()
 
     def watch_idle():
+        terminal_since = None
+        terminal_revision = None
         while not stop_watch.wait(0.5):
             try:
-                state.expire()
+                with state.lock:
+                    state.expire()
+                    d = state.data
+                    if d['status'] in TERMINAL:
+                        if terminal_since is None or terminal_revision != d['revision']:
+                            terminal_since, terminal_revision = time.monotonic(), d['revision']
+                        if time.monotonic() - terminal_since >= args.cleanup_seconds:
+                            state.prepare_stop(d['revision'])
+                            should_stop = True
+                        else:
+                            should_stop = False
+                    else:
+                        terminal_since = terminal_revision = None
+                        should_stop = False
+                if should_stop:
+                    server.shutdown()
+                    return
             except OSError:
                 pass  # 保留未决状态，下次重试落盘，不终止超时监视器。
 
@@ -364,16 +404,20 @@ def serve(args):
     finally:
         stop_watch.set()
         server.server_close()
+        print(json.dumps({'stopped': True, 'port': server.server_port}), flush=True)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['serve', 'publish', 'state', 'wait', 'finish', 'respond', 'bind-tab'])
+    p.add_argument('action', choices=['serve', 'publish', 'state', 'wait', 'finish', 'respond', 'bind-tab', 'stop'])
     p.add_argument('--session', required=True)
     p.add_argument('--port', type=int, default=0)
     p.add_argument('--thread-id', default=os.environ.get('CODEX_THREAD_ID'),
                    help='通知点击目标，默认当前 CODEX_THREAD_ID；恢复时须属于当前任务')
     p.add_argument('--idle-seconds', type=int, default=600, help='无操作超时秒数，默认 600；短值仅用于隔离测试')
+    p.add_argument('--cleanup-seconds', type=float, default=60,
+                   help='已结束题目的服务回收兜底秒数，默认60；短值仅用于测试')
+    p.add_argument('--revision', type=int, help='stop 必须指定当前题目版本')
     p.add_argument('--file')
     p.add_argument('--seconds', type=float, default=45)
     p.add_argument('--summary', default='本轮复核已完成。')
@@ -381,10 +425,16 @@ def main():
     p.add_argument('--browser-id')
     args = p.parse_args()
     if args.action == 'serve':
+        if not 0.1 <= args.cleanup_seconds <= 600:
+            p.error('cleanup-seconds 必须介于0.1和600秒')
         return serve(args)
     info = json.loads((Path(args.session) / 'connection.json').read_text())
     request_action = args.action
     body = None
+    if args.action == 'stop':
+        if args.revision is None:
+            p.error('stop 需要 --revision，防止误停新的题目')
+        body = {'revision': args.revision}
     if args.action == 'bind-tab':
         if not args.tab_id or not args.browser_id:
             p.error('bind-tab 需要 --tab-id 和 --browser-id')

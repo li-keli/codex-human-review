@@ -1,6 +1,6 @@
 {
   "name": "codex-human-review",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "在内置浏览器中进行富文本人工复核，按真实回答动态调整问题。",
   "author": {
     "name": "Local developer"
