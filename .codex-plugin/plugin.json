@@ -1,0 +1,18 @@
+{
+  "name": "codex-human-review",
+  "version": "0.5.2",
+  "description": "在内置浏览器中进行富文本人工复核，按真实回答动态调整问题。",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "人工逐项复核",
+    "shortDescription": "Pi 风格富文本审核、选项 Ask 与提交后关页。",
+    "longDescription": "用内置浏览器展示单列富文本审核卡片，选项 Ask 由当前 Codex 会话模型回答，最终提交后由任务自动关闭对应标签页。",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "请带我体验一次人工逐项复核的模拟流程。"
+  }
+}
